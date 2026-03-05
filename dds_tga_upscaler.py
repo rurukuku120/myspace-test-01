@@ -16,13 +16,19 @@ import subprocess
 import sys
 import time
 import queue
+import io
+import json
+import uuid
+import urllib.request
+import urllib.parse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 # ──────────────────────────────────────────
 # 상수
 # ──────────────────────────────────────────
 APP_TITLE   = "DDS → TGA 업스케일러"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DEFAULT_TARGET = 4096
 
 ESRGAN_MODELS = {
@@ -193,12 +199,6 @@ class ComfyUIEngine:
     def upscale(self, img, scale,
                 comfyui_host="127.0.0.1", comfyui_port=8188,
                 comfyui_model="RealESRGAN_x4plus.pth", **kw):
-        import io
-        import json
-        import uuid
-        import time
-        import urllib.request
-        import urllib.parse
         from PIL import Image
 
         base_url = f"http://{comfyui_host}:{comfyui_port}"
@@ -276,9 +276,10 @@ class ComfyUIEngine:
         if not prompt_id:
             raise RuntimeError(f"ComfyUI prompt_id 없음: {prompt_result}")
 
-        # ── 3. 완료 폴링 (최대 300초) ────────────
-        for _ in range(300):
-            time.sleep(1)
+        # ── 3. 완료 폴링 (최대 300초, 0.2초 간격) ──
+        out_info = None
+        for _ in range(1500):
+            time.sleep(0.2)
             try:
                 with urllib.request.urlopen(
                     f"{base_url}/history/{prompt_id}", timeout=10
@@ -291,14 +292,13 @@ class ComfyUIEngine:
                 continue
 
             outputs = history[prompt_id].get("outputs", {})
-            for node_id, node_out in outputs.items():
-                images = node_out.get("images", [])
-                if images:
-                    out_info = images[0]
+            for node_out in outputs.values():
+                imgs = node_out.get("images", [])
+                if imgs:
+                    out_info = imgs[0]
                     break
-            else:
-                continue
-            break
+            if out_info is not None:
+                break
         else:
             raise RuntimeError("ComfyUI 처리 타임아웃 (300초 초과)")
 
@@ -334,9 +334,8 @@ def read_dds(path: str):
     from PIL import Image
     try:
         img = Image.open(path)
-        if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
-            img = img.convert("RGBA")
-        elif img.mode == "P":
+        img.load()  # 파일 핸들 즉시 해제 (lazy load 방지)
+        if img.mode not in ("RGB", "RGBA", "L", "LA"):
             img = img.convert("RGBA")
         return img
     except Exception as e:
@@ -353,18 +352,19 @@ def split_rgba_channels(img, channels: list, tga_path: str) -> list:
 
     arr = np.array(img.convert("RGBA"))
     ch_map = {"R": 0, "G": 1, "B": 2, "A": 3}
-    saved = []
     base = Path(tga_path)
 
-    for ch in channels:
+    def _save_channel(ch):
         idx = ch_map.get(ch.upper())
         if idx is None:
-            continue
-        ch_img = Image.fromarray(arr[:, :, idx], mode="L")
+            return None
         out = base.parent / f"{base.stem}_{ch.upper()}.tga"
-        ch_img.save(str(out), format="TGA")
-        saved.append(str(out))
-    return saved
+        Image.fromarray(arr[:, :, idx], mode="L").save(str(out), format="TGA")
+        return str(out)
+
+    with ThreadPoolExecutor(max_workers=min(len(channels), 4)) as ex:
+        results = list(ex.map(_save_channel, channels))
+    return [r for r in results if r is not None]
 
 
 # ──────────────────────────────────────────
@@ -410,6 +410,20 @@ class ProcessWorker(threading.Thread):
         scale  = s.get("scale", 4)
         target = s.get("target_size", DEFAULT_TARGET)
 
+        # 다음 파일 미리 읽기용 executor
+        _prefetch_ex = ThreadPoolExecutor(max_workers=1)
+        _prefetch_future = None
+
+        def _prefetch(path):
+            try:
+                return read_dds(path)
+            except Exception:
+                return None
+
+        # 첫 번째 파일 미리 읽기 시작
+        if self.files:
+            _prefetch_future = _prefetch_ex.submit(_prefetch, self.files[0])
+
         for i, dds_path in enumerate(self.files):
             if self._stop.is_set():
                 self._log("⛔ 처리 중단됨", "WARN")
@@ -433,10 +447,23 @@ class ProcessWorker(threading.Thread):
 
                 if os.path.exists(tga_path) and not s.get("overwrite", True):
                     self._log(f"  건너뜀 (이미 존재): {stem}.tga", "WARN")
+                    # 건너뛰어도 다음 파일 prefetch
+                    if i + 1 < len(self.files):
+                        _prefetch_future = _prefetch_ex.submit(_prefetch, self.files[i + 1])
                     continue
 
-                # DDS 읽기
-                img = read_dds(dds_path)
+                # DDS 읽기 (prefetch 결과 우선 사용)
+                if _prefetch_future is not None:
+                    img = _prefetch_future.result()
+                    _prefetch_future = None
+                    if img is None:
+                        img = read_dds(dds_path)
+                else:
+                    img = read_dds(dds_path)
+
+                # 다음 파일 미리 읽기 시작 (현재 업스케일 중에 병렬 실행)
+                if i + 1 < len(self.files):
+                    _prefetch_future = _prefetch_ex.submit(_prefetch, self.files[i + 1])
                 self._log(f"  읽기 완료: {img.size[0]}x{img.size[1]} {img.mode}")
 
                 # 업스케일 필요 여부 판단
@@ -479,6 +506,7 @@ class ProcessWorker(threading.Thread):
             except Exception as e:
                 self._log(f"  오류: {e}", "ERROR")
 
+        _prefetch_ex.shutdown(wait=False)
         self._prog(total, total)
         self.q.put({"type": "done"})
 
@@ -513,7 +541,7 @@ class App(tk.Tk):
         self._init_vars()
         self._apply_style()
         self._build_ui()
-        self.after(100, self._poll_queue)
+        self.after(50, self._poll_queue)
         self.after(200, self._check_deps_async)
 
     # ── 변수 초기화 ──────────────────────
@@ -1104,7 +1132,7 @@ class App(tk.Tk):
                     messagebox.showinfo("완료", "변환이 완료되었습니다!")
         except queue.Empty:
             pass
-        self.after(100, self._poll_queue)
+        self.after(50, self._poll_queue)
 
     # ── 의존성 확인 ───────────────────────
     def _check_deps_async(self):
