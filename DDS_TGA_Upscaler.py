@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 # 상수
 # ──────────────────────────────────────────
 APP_TITLE   = "DDS → TGA 업스케일러"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DEFAULT_TARGET = 4096
 
 ESRGAN_MODELS = {
@@ -57,6 +57,29 @@ COMFYUI_UPSCALE_MODELS = [
     "4x-UltraSharp.pth",
     "4x_NMKD-Siax_200k.pth",
     "8x_NMKD-Superscale.pth",
+]
+
+COMFYUI_CONTROLNET_MODELS = [
+    "control_v11f1e_sd15_tile.pth",
+    "control_v11f1e_sd15_tile_fp8_e4m3fn.safetensors",
+    "controlnet-tile-sdxl-1.0.safetensors",
+]
+
+COMFYUI_SD_CHECKPOINTS = [
+    "v1-5-pruned-emaonly.safetensors",
+    "v1-5-pruned-emaonly.ckpt",
+    "dreamshaper_8.safetensors",
+    "revAnimated_v122.safetensors",
+    "realisticVisionV60B1_v51VAE.safetensors",
+]
+
+COMFYUI_SAMPLERS = [
+    "euler_ancestral",
+    "euler",
+    "dpmpp_2m_sde",
+    "dpm_2_ancestral",
+    "dpmpp_2m",
+    "dpmpp_sde",
 ]
 
 # ──────────────────────────────────────────
@@ -198,7 +221,19 @@ class ComfyUIEngine:
 
     def upscale(self, img, scale,
                 comfyui_host="127.0.0.1", comfyui_port=8188,
-                comfyui_model="RealESRGAN_x4plus.pth", **kw):
+                comfyui_model="RealESRGAN_x4plus.pth",
+                comfyui_workflow="upscale",
+                comfyui_sd_model="v1-5-pruned-emaonly.safetensors",
+                comfyui_cn_model="control_v11f1e_sd15_tile.pth",
+                comfyui_cn_strength=1.0,
+                comfyui_denoise=0.35,
+                comfyui_cfg=7.0,
+                comfyui_steps=20,
+                comfyui_sampler="euler_ancestral",
+                comfyui_pos_prompt="high quality texture, detailed",
+                comfyui_neg_prompt="blurry, low quality, artifacts",
+                **kw):
+        import random
         from PIL import Image
 
         base_url = f"http://{comfyui_host}:{comfyui_port}"
@@ -236,30 +271,74 @@ class ComfyUIEngine:
 
         # ── 2. 워크플로우(프롬프트) 전송 ──────────
         client_id = uuid.uuid4().hex
-        workflow = {
-            "1": {
-                "class_type": "LoadImage",
-                "inputs": {"image": uploaded_name},
-            },
-            "2": {
-                "class_type": "UpscaleModelLoader",
-                "inputs": {"model_name": comfyui_model},
-            },
-            "3": {
-                "class_type": "ImageUpscaleWithModel",
-                "inputs": {
-                    "upscale_model": ["2", 0],
-                    "image":         ["1", 0],
+
+        if comfyui_workflow == "controlnet_tile":
+            # ControlNet Tile: ESRGAN 초기 업스케일 → SD img2img (구조 보존)
+            w, h = img.size
+            target_w = w * scale
+            target_h = h * scale
+            seed = random.randint(0, 2 ** 32 - 1)
+            workflow = {
+                "1":  {"class_type": "CheckpointLoaderSimple",
+                       "inputs": {"ckpt_name": comfyui_sd_model}},
+                "2":  {"class_type": "CLIPTextEncode",
+                       "inputs": {"text": comfyui_pos_prompt, "clip": ["1", 1]}},
+                "3":  {"class_type": "CLIPTextEncode",
+                       "inputs": {"text": comfyui_neg_prompt, "clip": ["1", 1]}},
+                "4":  {"class_type": "LoadImage",
+                       "inputs": {"image": uploaded_name}},
+                "5":  {"class_type": "UpscaleModelLoader",
+                       "inputs": {"model_name": comfyui_model}},
+                "6":  {"class_type": "ImageUpscaleWithModel",
+                       "inputs": {"upscale_model": ["5", 0], "image": ["4", 0]}},
+                "7":  {"class_type": "ImageScale",
+                       "inputs": {"image": ["6", 0], "upscale_method": "bilinear",
+                                  "width": target_w, "height": target_h, "crop": "disabled"}},
+                "8":  {"class_type": "VAEEncode",
+                       "inputs": {"pixels": ["7", 0], "vae": ["1", 2]}},
+                "9":  {"class_type": "ControlNetLoader",
+                       "inputs": {"control_net_name": comfyui_cn_model}},
+                "10": {"class_type": "ControlNetApply",
+                       "inputs": {"conditioning": ["2", 0], "control_net": ["9", 0],
+                                  "image": ["7", 0], "strength": comfyui_cn_strength}},
+                "11": {"class_type": "KSampler",
+                       "inputs": {"model": ["1", 0], "positive": ["10", 0],
+                                  "negative": ["3", 0], "latent_image": ["8", 0],
+                                  "seed": seed, "steps": comfyui_steps,
+                                  "cfg": comfyui_cfg, "sampler_name": comfyui_sampler,
+                                  "scheduler": "karras", "denoise": comfyui_denoise}},
+                "12": {"class_type": "VAEDecode",
+                       "inputs": {"samples": ["11", 0], "vae": ["1", 2]}},
+                "13": {"class_type": "SaveImage",
+                       "inputs": {"images": ["12", 0],
+                                  "filename_prefix": f"dds_cntile_{uuid.uuid4().hex[:8]}"}},
+            }
+        else:
+            # 기본 업스케일 모델 워크플로우
+            workflow = {
+                "1": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": uploaded_name},
                 },
-            },
-            "4": {
-                "class_type": "SaveImage",
-                "inputs": {
-                    "images":        ["3", 0],
-                    "filename_prefix": f"dds_up_{uuid.uuid4().hex[:8]}",
+                "2": {
+                    "class_type": "UpscaleModelLoader",
+                    "inputs": {"model_name": comfyui_model},
                 },
-            },
-        }
+                "3": {
+                    "class_type": "ImageUpscaleWithModel",
+                    "inputs": {
+                        "upscale_model": ["2", 0],
+                        "image":         ["1", 0],
+                    },
+                },
+                "4": {
+                    "class_type": "SaveImage",
+                    "inputs": {
+                        "images":        ["3", 0],
+                        "filename_prefix": f"dds_up_{uuid.uuid4().hex[:8]}",
+                    },
+                },
+            }
         payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
         req2 = urllib.request.Request(
             f"{base_url}/prompt",
@@ -476,15 +555,25 @@ class ProcessWorker(threading.Thread):
                 else:
                     img_up = engine.upscale(
                         img, scale,
-                        model_name     = s.get("model_name", "RealESRGAN_x4plus"),
-                        gpu_id         = s.get("gpu_id", 0),
-                        tile           = s.get("tile_size", 0),
-                        denoise        = s.get("denoise", 2),
-                        exe_path       = s.get("ncnn_exe", ""),
-                        model          = s.get("ncnn_model", ""),
-                        comfyui_host   = s.get("comfyui_host", "127.0.0.1"),
-                        comfyui_port   = s.get("comfyui_port", 8188),
-                        comfyui_model  = s.get("comfyui_model", "RealESRGAN_x4plus.pth"),
+                        model_name          = s.get("model_name", "RealESRGAN_x4plus"),
+                        gpu_id              = s.get("gpu_id", 0),
+                        tile                = s.get("tile_size", 0),
+                        denoise             = s.get("denoise", 2),
+                        exe_path            = s.get("ncnn_exe", ""),
+                        model               = s.get("ncnn_model", ""),
+                        comfyui_host        = s.get("comfyui_host", "127.0.0.1"),
+                        comfyui_port        = s.get("comfyui_port", 8188),
+                        comfyui_model       = s.get("comfyui_model", "RealESRGAN_x4plus.pth"),
+                        comfyui_workflow    = s.get("comfyui_workflow", "upscale"),
+                        comfyui_sd_model    = s.get("comfyui_sd_model", "v1-5-pruned-emaonly.safetensors"),
+                        comfyui_cn_model    = s.get("comfyui_cn_model", "control_v11f1e_sd15_tile.pth"),
+                        comfyui_cn_strength = s.get("comfyui_cn_strength", 1.0),
+                        comfyui_denoise     = s.get("comfyui_denoise", 0.35),
+                        comfyui_cfg         = s.get("comfyui_cfg", 7.0),
+                        comfyui_steps       = s.get("comfyui_steps", 20),
+                        comfyui_sampler     = s.get("comfyui_sampler", "euler_ancestral"),
+                        comfyui_pos_prompt  = s.get("comfyui_pos_prompt", "high quality texture, detailed"),
+                        comfyui_neg_prompt  = s.get("comfyui_neg_prompt", "blurry, low quality, artifacts"),
                     )
                     self._log(f"  업스케일 완료: {img_up.size[0]}x{img_up.size[1]}")
 
@@ -549,7 +638,6 @@ class App(tk.Tk):
         self.var_engine         = tk.StringVar(value="realesrgan_python")
         self.var_ncnn_exe       = tk.StringVar()
         self.var_esrgan_model   = tk.StringVar(value=list(ESRGAN_MODELS.keys())[0])
-        self.var_ncnn_re_model  = tk.StringVar(value=list(REALESRGAN_NCNN_MODELS.keys())[0])
         self.var_w2x_model      = tk.StringVar(value=list(WAIFU2X_MODELS.keys())[0])
         self.var_scale          = tk.StringVar(value="4x")
         self.var_target         = tk.StringVar(value=str(DEFAULT_TARGET))
@@ -565,9 +653,19 @@ class App(tk.Tk):
         self.var_ch_g           = tk.BooleanVar(value=True)
         self.var_ch_b           = tk.BooleanVar(value=True)
         self.var_ch_a           = tk.BooleanVar(value=True)
-        self.var_comfyui_host   = tk.StringVar(value="127.0.0.1")
-        self.var_comfyui_port   = tk.StringVar(value="8188")
-        self.var_comfyui_model  = tk.StringVar(value=COMFYUI_UPSCALE_MODELS[0])
+        self.var_comfyui_host        = tk.StringVar(value="127.0.0.1")
+        self.var_comfyui_port        = tk.StringVar(value="8188")
+        self.var_comfyui_model       = tk.StringVar(value=COMFYUI_UPSCALE_MODELS[0])
+        self.var_comfyui_workflow    = tk.StringVar(value="upscale")
+        self.var_comfyui_sd_model    = tk.StringVar(value=COMFYUI_SD_CHECKPOINTS[0])
+        self.var_comfyui_cn_model    = tk.StringVar(value=COMFYUI_CONTROLNET_MODELS[0])
+        self.var_comfyui_cn_strength = tk.DoubleVar(value=1.0)
+        self.var_comfyui_denoise     = tk.DoubleVar(value=0.35)
+        self.var_comfyui_cfg         = tk.DoubleVar(value=7.0)
+        self.var_comfyui_steps       = tk.IntVar(value=20)
+        self.var_comfyui_sampler     = tk.StringVar(value="euler_ancestral")
+        self.var_comfyui_pos_prompt  = tk.StringVar(value="high quality texture, detailed")
+        self.var_comfyui_neg_prompt  = tk.StringVar(value="blurry, low quality, artifacts")
 
     # ── ttk 스타일 ────────────────────────
     def _apply_style(self):
@@ -744,8 +842,6 @@ class App(tk.Tk):
         engines = [
             ("Real-ESRGAN  Python 패키지  (pip install realesrgan basicsr torch)",
              "realesrgan_python"),
-            ("Real-ESRGAN  ncnn-vulkan  (외부 .exe, AMD/NVIDIA GPU)",
-             "realesrgan_ncnn"),
             ("Waifu2x  ncnn-vulkan  (외부 .exe, 애니/만화 전용)",
              "waifu2x_ncnn"),
             ("ComfyUI  REST API  (로컬 ComfyUI 서버, http://127.0.0.1:8188)",
@@ -757,6 +853,29 @@ class App(tk.Tk):
             ttk.Radiobutton(c, text=label, variable=self.var_engine, value=val,
                             style="TRadiobutton",
                             command=self._refresh_engine_ui).pack(anchor="w", pady=2)
+
+        # ncnn 다운로드 안내
+        self.f_ncnn_info = ttk.Frame(c, style="Card.TFrame")
+        self.f_ncnn_info.pack(fill="x", pady=(10, 0))
+        _info_w2x = (
+            "[ Waifu2x ncnn-vulkan 설치 방법 ]\n"
+            "1. 아래 주소에서 최신 Windows zip 다운로드\n"
+            "   https://github.com/nihui/waifu2x-ncnn-vulkan/releases\n"
+            "   → waifu2x-ncnn-vulkan-YYYYMMDD-windows.zip\n"
+            "2. 원하는 폴더에 압축 해제\n"
+            "   (exe 파일과 models/ 폴더가 같은 위치에 있어야 함)\n"
+            "3. 아래 '찾기' 버튼으로 waifu2x-ncnn-vulkan.exe 선택\n\n"
+            "※ AMD / NVIDIA GPU 필요 (Vulkan 지원 GPU)\n"
+            "※ 애니 / 만화 스타일 텍스처에 최적화\n"
+            "※ 모델 파일은 zip 안에 포함 — 별도 다운로드 불필요"
+        )
+        self._ncnn_info_w2x = _info_w2x
+        self._ncnn_info_text = tk.Text(
+            self.f_ncnn_info, height=9, bg="#181825", fg=self.YELLOW,
+            font=("Consolas", 8), relief="flat", borderwidth=0,
+            wrap="none", state="disabled"
+        )
+        self._ncnn_info_text.pack(fill="x", padx=4, pady=(4, 0))
 
         # ncnn 실행파일 경로
         self.f_ncnn_exe = ttk.Frame(c, style="Card.TFrame")
@@ -782,49 +901,102 @@ class App(tk.Tk):
         ttk.Label(r_model, text="(models/upscale_models/ 에 배치)",
                   style="Sub.TLabel").pack(side="left")
 
+        # ── 워크플로우 선택 ──────────────────────
+        r_wf = self._row(self.f_comfyui, "워크플로우:", 12)
+        ttk.Radiobutton(r_wf, text="업스케일 모델  (빠름)",
+                        variable=self.var_comfyui_workflow, value="upscale",
+                        style="TRadiobutton",
+                        command=self._refresh_comfyui_ui).pack(side="left", padx=(4, 12))
+        ttk.Radiobutton(r_wf, text="ControlNet Tile  (구조 보존, SD 필요)",
+                        variable=self.var_comfyui_workflow, value="controlnet_tile",
+                        style="TRadiobutton",
+                        command=self._refresh_comfyui_ui).pack(side="left")
+
+        # ── ControlNet Tile 세부 설정 (토글) ────
+        self.f_comfyui_cn = ttk.Frame(self.f_comfyui, style="Card.TFrame")
+
+        r_sd = self._row(self.f_comfyui_cn, "SD 체크포인트:", 14)
+        ttk.Combobox(r_sd, textvariable=self.var_comfyui_sd_model,
+                     values=COMFYUI_SD_CHECKPOINTS, width=36).pack(side="left", padx=4)
+        ttk.Label(r_sd, text="(models/checkpoints/)", style="Sub.TLabel").pack(side="left")
+
+        r_cn = self._row(self.f_comfyui_cn, "ControlNet 모델:", 14)
+        ttk.Combobox(r_cn, textvariable=self.var_comfyui_cn_model,
+                     values=COMFYUI_CONTROLNET_MODELS, width=36).pack(side="left", padx=4)
+        ttk.Label(r_cn, text="(models/controlnet/)", style="Sub.TLabel").pack(side="left")
+
+        r_dn = self._row(self.f_comfyui_cn, "Denoise:", 14)
+        self.lbl_comfyui_dn = ttk.Label(r_dn, text="0.35", style="Card.TLabel", width=4)
+        ttk.Scale(r_dn, from_=0.0, to=1.0, orient="horizontal",
+                  variable=self.var_comfyui_denoise, length=120,
+                  command=lambda v: self.lbl_comfyui_dn.configure(
+                      text=f"{float(v):.2f}")).pack(side="left", padx=4)
+        self.lbl_comfyui_dn.pack(side="left")
+        ttk.Label(r_dn, text="(낮을수록 원본 유지 — 0.3~0.5 권장)",
+                  style="Sub.TLabel").pack(side="left", padx=8)
+
+        r_cs = self._row(self.f_comfyui_cn, "CFG / Steps:", 14)
+        ttk.Spinbox(r_cs, from_=1.0, to=20.0, increment=0.5,
+                    textvariable=self.var_comfyui_cfg,
+                    width=6, format="%.1f").pack(side="left", padx=4)
+        ttk.Label(r_cs, text="CFG    Steps:", style="Card.TLabel").pack(side="left", padx=(8, 0))
+        ttk.Spinbox(r_cs, from_=1, to=100,
+                    textvariable=self.var_comfyui_steps, width=5).pack(side="left", padx=4)
+
+        r_smp = self._row(self.f_comfyui_cn, "샘플러:", 14)
+        ttk.Combobox(r_smp, textvariable=self.var_comfyui_sampler,
+                     values=COMFYUI_SAMPLERS, state="readonly",
+                     width=22).pack(side="left", padx=4)
+
+        r_pos = self._row(self.f_comfyui_cn, "긍정 프롬프트:", 14)
+        ttk.Entry(r_pos, textvariable=self.var_comfyui_pos_prompt,
+                  width=46).pack(side="left", padx=4, fill="x", expand=True)
+
+        r_neg = self._row(self.f_comfyui_cn, "부정 프롬프트:", 14)
+        ttk.Entry(r_neg, textvariable=self.var_comfyui_neg_prompt,
+                  width=46).pack(side="left", padx=4, fill="x", expand=True)
+
         # 모델 선택
         c2 = self._card(parent, "🎯  모델")
 
-        # Python ESRGAN 모델
-        self.f_esrgan_model = ttk.Frame(c2, style="Card.TFrame")
-        self.f_esrgan_model.pack(fill="x", pady=2)
-        ttk.Label(self.f_esrgan_model, text="모델:", style="Card.TLabel",
+        # 통합 모델 행 (엔진에 따라 values/textvariable만 교체)
+        self.f_model_row = ttk.Frame(c2, style="Card.TFrame")
+        self.f_model_row.pack(fill="x", pady=2)
+        ttk.Label(self.f_model_row, text="모델:", style="Card.TLabel",
                   width=8).pack(side="left")
-        ttk.Combobox(self.f_esrgan_model, textvariable=self.var_esrgan_model,
-                     values=list(ESRGAN_MODELS.keys()), state="readonly",
-                     width=46).pack(side="left", padx=4)
-
-        # ESRGAN ncnn 모델
-        self.f_re_ncnn_model = ttk.Frame(c2, style="Card.TFrame")
-        ttk.Label(self.f_re_ncnn_model, text="모델:", style="Card.TLabel",
-                  width=8).pack(side="left")
-        ttk.Combobox(self.f_re_ncnn_model, textvariable=self.var_ncnn_re_model,
-                     values=list(REALESRGAN_NCNN_MODELS.keys()), state="readonly",
-                     width=46).pack(side="left", padx=4)
-
-        # Waifu2x 모델
-        self.f_w2x_model = ttk.Frame(c2, style="Card.TFrame")
-        ttk.Label(self.f_w2x_model, text="모델:", style="Card.TLabel",
-                  width=8).pack(side="left")
-        ttk.Combobox(self.f_w2x_model, textvariable=self.var_w2x_model,
-                     values=list(WAIFU2X_MODELS.keys()), state="readonly",
-                     width=46).pack(side="left", padx=4)
+        self.cb_model = ttk.Combobox(self.f_model_row,
+                     textvariable=self.var_esrgan_model,
+                     values=list(ESRGAN_MODELS.keys()),
+                     state="readonly", width=46)
+        self.cb_model.pack(side="left", padx=4)
+        self.cb_model.bind("<<ComboboxSelected>>", self._on_model_select)
 
         # 세부 설정
         c3 = self._card(parent, "🔧  세부 설정")
 
-        r1 = self._row(c3, "업스케일 배율:", 14)
-        ttk.Combobox(r1, textvariable=self.var_scale,
-                     values=["2x", "4x"], state="readonly", width=7).pack(side="left", padx=4)
+        self.f_scale_row = ttk.Frame(c3, style="Card.TFrame")
+        self.f_scale_row.pack(fill="x", pady=3)
+        ttk.Label(self.f_scale_row, text="업스케일 배율:", style="Card.TLabel",
+                  width=14).pack(side="left")
+        self.cb_scale = ttk.Combobox(self.f_scale_row, textvariable=self.var_scale,
+                     values=["2x", "4x"], state="readonly", width=7)
+        self.cb_scale.pack(side="left", padx=4)
+        self.lbl_scale_hint = ttk.Label(self.f_scale_row,
+                     text="(모델에서 자동 설정)", style="Sub.TLabel")
+        self.lbl_scale_hint.pack(side="left", padx=4)
 
         r2 = self._row(c3, "GPU ID:", 14)
-        ttk.Spinbox(r2, from_=-1, to=7, textvariable=self.var_gpu_id,
-                    width=5).pack(side="left", padx=4)
+        sp_gpu = ttk.Spinbox(r2, from_=-1, to=7, textvariable=self.var_gpu_id, width=5)
+        sp_gpu.pack(side="left", padx=4)
+        sp_gpu.bind("<ButtonRelease-1>", lambda e: self._refresh_model_display())
+        sp_gpu.bind("<KeyRelease>",      lambda e: self._refresh_model_display())
         ttk.Label(r2, text="(-1 = CPU 강제)", style="Card.TLabel").pack(side="left")
 
         r3 = self._row(c3, "타일 크기:", 14)
-        ttk.Spinbox(r3, from_=0, to=2048, increment=64, textvariable=self.var_tile,
-                    width=7).pack(side="left", padx=4)
+        sp_tile = ttk.Spinbox(r3, from_=0, to=2048, increment=64, textvariable=self.var_tile, width=7)
+        sp_tile.pack(side="left", padx=4)
+        sp_tile.bind("<ButtonRelease-1>", lambda e: self._refresh_model_display())
+        sp_tile.bind("<KeyRelease>",      lambda e: self._refresh_model_display())
         ttk.Label(r3, text="(0=자동  |  VRAM 부족 시 256~512)", style="Card.TLabel").pack(side="left")
 
         self.f_denoise = self._row(c3, "노이즈 제거:", 14)
@@ -837,6 +1009,10 @@ class App(tk.Tk):
         self.lbl_dn.pack(side="left")
         ttk.Label(self.f_denoise, text="(-1=없음, Waifu2x 전용)",
                   style="Sub.TLabel").pack(side="left", padx=8)
+
+        # 세부 설정 변수 변경 시 모델 콤보박스 강제 갱신 (Windows readonly 버그 대응)
+        for var in (self.var_gpu_id, self.var_tile, self.var_scale, self.var_denoise):
+            var.trace_add("write", lambda *_: self.after(10, self._refresh_model_display))
 
         self._refresh_engine_ui()
 
@@ -932,14 +1108,22 @@ class App(tk.Tk):
     # ── UI 상태 갱신 ──────────────────────
     def _refresh_engine_ui(self):
         engine = self.var_engine.get()
-        is_ncnn_re  = engine == "realesrgan_ncnn"
         is_ncnn_w2  = engine == "waifu2x_ncnn"
         is_python   = engine == "realesrgan_python"
-        is_ncnn     = is_ncnn_re or is_ncnn_w2
         is_comfyui  = engine == "comfyui"
 
+        # ncnn 다운로드 안내
+        if is_ncnn_w2:
+            self.f_ncnn_info.pack(fill="x", pady=(10, 0))
+            self._ncnn_info_text.configure(state="normal")
+            self._ncnn_info_text.delete("1.0", "end")
+            self._ncnn_info_text.insert("1.0", self._ncnn_info_w2x)
+            self._ncnn_info_text.configure(state="disabled")
+        else:
+            self.f_ncnn_info.pack_forget()
+
         # ncnn 실행파일 행
-        if is_ncnn:
+        if is_ncnn_w2:
             self.f_ncnn_exe.pack(fill="x", pady=(8, 0))
         else:
             self.f_ncnn_exe.pack_forget()
@@ -947,17 +1131,35 @@ class App(tk.Tk):
         # ComfyUI 서버 설정 행
         if is_comfyui:
             self.f_comfyui.pack(fill="x", pady=(8, 0))
+            self._refresh_comfyui_ui()
         else:
             self.f_comfyui.pack_forget()
 
-        # 모델 행
-        self.f_esrgan_model.pack_forget()
-        self.f_re_ncnn_model.pack_forget()
-        self.f_w2x_model.pack_forget()
-        if is_python or is_ncnn_re:
-            self.f_esrgan_model.pack(fill="x", pady=2)
+        # 모델 행 — 콤보박스 위젯은 고정, values/textvariable만 교체
+        if is_python:
+            self.f_model_row.pack(fill="x", pady=2)
+            self.cb_model.configure(values=list(ESRGAN_MODELS.keys()),
+                                    textvariable=self.var_esrgan_model)
+            self.cb_model.set(self.var_esrgan_model.get())
         elif is_ncnn_w2:
-            self.f_w2x_model.pack(fill="x", pady=2)
+            self.f_model_row.pack(fill="x", pady=2)
+            self.cb_model.configure(values=list(WAIFU2X_MODELS.keys()),
+                                    textvariable=self.var_w2x_model)
+            self.cb_model.set(self.var_w2x_model.get())
+        else:
+            self.f_model_row.pack_forget()
+
+        # 업스케일 배율
+        if is_comfyui:
+            self.f_scale_row.pack_forget()
+        else:
+            self.f_scale_row.pack(fill="x", pady=3)
+            if is_python:
+                self.cb_scale.configure(state="disabled")
+                self.lbl_scale_hint.pack(side="left", padx=4)
+            else:
+                self.cb_scale.configure(state="readonly")
+                self.lbl_scale_hint.pack_forget()
 
         # 노이즈 (waifu2x 전용)
         if is_ncnn_w2:
@@ -965,10 +1167,29 @@ class App(tk.Tk):
         else:
             self.f_denoise.pack_forget()
 
+    def _on_model_select(self, event=None):
+        """모델 선택 시 업스케일 배율 자동 맞춤 (Real-ESRGAN Python 전용)"""
+        if self.var_engine.get() == "realesrgan_python":
+            _, scale = ESRGAN_MODELS.get(self.var_esrgan_model.get(), ("", 4))
+            self.var_scale.set(f"{scale}x")
+
+    def _refresh_model_display(self):
+        engine = self.var_engine.get()
+        if engine == "realesrgan_python":
+            self.cb_model.set(self.var_esrgan_model.get())
+        elif engine == "waifu2x_ncnn":
+            self.cb_model.set(self.var_w2x_model.get())
+
     def _refresh_rgba_ui(self):
         enabled = self.var_split.get()
         for cb in self.ch_checks:
             cb.configure(state="normal" if enabled else "disabled")
+
+    def _refresh_comfyui_ui(self):
+        if self.var_comfyui_workflow.get() == "controlnet_tile":
+            self.f_comfyui_cn.pack(fill="x", pady=(6, 0))
+        else:
+            self.f_comfyui_cn.pack_forget()
 
     # ── 파일 목록 핸들러 ─────────────────
     def _add_files(self):
@@ -1050,11 +1271,14 @@ class App(tk.Tk):
                     channels.append(ch)
 
         engine = self.var_engine.get()
-        model_name, _ = ESRGAN_MODELS.get(
+        model_name, esrgan_scale = ESRGAN_MODELS.get(
             self.var_esrgan_model.get(), ("RealESRGAN_x4plus", 4))
-        ncnn_re_model = REALESRGAN_NCNN_MODELS.get(self.var_ncnn_re_model.get(), "")
-        w2x_model     = WAIFU2X_MODELS.get(self.var_w2x_model.get(), "")
-        ncnn_model    = ncnn_re_model if engine == "realesrgan_ncnn" else w2x_model
+        ncnn_model = WAIFU2X_MODELS.get(self.var_w2x_model.get(), "")
+
+        if engine == "realesrgan_python":
+            scale_val = esrgan_scale
+        else:
+            scale_val = int(self.var_scale.get().replace("x", ""))
 
         try:
             target = int(self.var_target.get())
@@ -1066,7 +1290,7 @@ class App(tk.Tk):
             "ncnn_exe":       self.var_ncnn_exe.get(),
             "model_name":     model_name,
             "ncnn_model":     ncnn_model,
-            "scale":          int(self.var_scale.get().replace("x", "")),
+            "scale":          scale_val,
             "target_size":    target,
             "gpu_id":         self.var_gpu_id.get(),
             "tile_size":      self.var_tile.get(),
@@ -1077,9 +1301,19 @@ class App(tk.Tk):
             "overwrite":      self.var_overwrite.get(),
             "split_channels": bool(channels),
             "channels":       channels,
-            "comfyui_host":   self.var_comfyui_host.get().strip(),
-            "comfyui_port":   int(self.var_comfyui_port.get() or 8188),
-            "comfyui_model":  self.var_comfyui_model.get(),
+            "comfyui_host":        self.var_comfyui_host.get().strip(),
+            "comfyui_port":        int(self.var_comfyui_port.get() or 8188),
+            "comfyui_model":       self.var_comfyui_model.get(),
+            "comfyui_workflow":    self.var_comfyui_workflow.get(),
+            "comfyui_sd_model":    self.var_comfyui_sd_model.get(),
+            "comfyui_cn_model":    self.var_comfyui_cn_model.get(),
+            "comfyui_cn_strength": self.var_comfyui_cn_strength.get(),
+            "comfyui_denoise":     self.var_comfyui_denoise.get(),
+            "comfyui_cfg":         self.var_comfyui_cfg.get(),
+            "comfyui_steps":       self.var_comfyui_steps.get(),
+            "comfyui_sampler":     self.var_comfyui_sampler.get(),
+            "comfyui_pos_prompt":  self.var_comfyui_pos_prompt.get(),
+            "comfyui_neg_prompt":  self.var_comfyui_neg_prompt.get(),
         }
 
         self.btn_start.configure(state="disabled")
@@ -1166,13 +1400,8 @@ class App(tk.Tk):
 # 진입점
 # ──────────────────────────────────────────
 if __name__ == "__main__":
-    try:
-        from PIL import Image    # noqa
-        import numpy             # noqa
-    except ImportError:
-        print("필수 패키지를 설치합니다...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "Pillow", "numpy", "-q"],
-                       check=False)
+    import multiprocessing
+    multiprocessing.freeze_support()
 
     app = App()
     app.mainloop()
