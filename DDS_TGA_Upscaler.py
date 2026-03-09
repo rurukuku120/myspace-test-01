@@ -28,7 +28,8 @@ from concurrent.futures import ThreadPoolExecutor
 # 상수
 # ──────────────────────────────────────────
 APP_TITLE   = "DDS → TGA 업스케일러"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
+COMFYUI_CLOUD_BASE_URL = "https://cloud.comfy.org"
 DEFAULT_TARGET = 4096
 
 ESRGAN_MODELS = {
@@ -221,6 +222,7 @@ class ComfyUIEngine:
 
     def upscale(self, img, scale,
                 comfyui_host="127.0.0.1", comfyui_port=8188,
+                comfyui_use_cloud=False, comfyui_api_key="",
                 comfyui_model="RealESRGAN_x4plus.pth",
                 comfyui_workflow="upscale",
                 comfyui_sd_model="v1-5-pruned-emaonly.safetensors",
@@ -236,7 +238,15 @@ class ComfyUIEngine:
         import random
         from PIL import Image
 
-        base_url = f"http://{comfyui_host}:{comfyui_port}"
+        # ── 서버 모드 분기 ────────────────────────
+        if comfyui_use_cloud:
+            base_url   = COMFYUI_CLOUD_BASE_URL
+            api_prefix = "/api"
+            auth_hdr   = {"X-API-Key": comfyui_api_key}
+        else:
+            base_url   = f"http://{comfyui_host}:{comfyui_port}"
+            api_prefix = ""
+            auth_hdr   = {}
 
         # ── 1. 이미지 업로드 ──────────────────────
         has_alpha = img.mode in ("RGBA", "LA")
@@ -250,22 +260,37 @@ class ComfyUIEngine:
 
         upload_filename = f"dds_upscaler_{uuid.uuid4().hex}.png"
         boundary = uuid.uuid4().hex
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="image"; filename="{upload_filename}"\r\n'
-            f"Content-Type: image/png\r\n\r\n"
-        ).encode() + img_bytes + f"\r\n--{boundary}--\r\n".encode()
 
+        # 클라우드 모드는 type=input 필드 추가 필요
+        if comfyui_use_cloud:
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="image"; filename="{upload_filename}"\r\n'
+                f"Content-Type: image/png\r\n\r\n"
+            ).encode() + img_bytes + (
+                f"\r\n--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="type"\r\n\r\n'
+                f"input\r\n--{boundary}--\r\n"
+            ).encode()
+        else:
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="image"; filename="{upload_filename}"\r\n'
+                f"Content-Type: image/png\r\n\r\n"
+            ).encode() + img_bytes + f"\r\n--{boundary}--\r\n".encode()
+
+        upload_headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        upload_headers.update(auth_hdr)
         req = urllib.request.Request(
-            f"{base_url}/upload/image",
+            f"{base_url}{api_prefix}/upload/image",
             data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            headers=upload_headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 upload_result = json.loads(resp.read())
         except Exception as e:
-            raise RuntimeError(f"ComfyUI 이미지 업로드 실패: {e}\n서버가 실행 중인지 확인하세요.")
+            raise RuntimeError(f"ComfyUI 이미지 업로드 실패: {e}\n{'API 키를 확인하세요.' if comfyui_use_cloud else '서버가 실행 중인지 확인하세요.'}")
 
         uploaded_name = upload_result.get("name", upload_filename)
 
@@ -340,10 +365,12 @@ class ComfyUIEngine:
                 },
             }
         payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
+        prompt_headers = {"Content-Type": "application/json"}
+        prompt_headers.update(auth_hdr)
         req2 = urllib.request.Request(
-            f"{base_url}/prompt",
+            f"{base_url}{api_prefix}/prompt",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=prompt_headers,
         )
         try:
             with urllib.request.urlopen(req2, timeout=30) as resp:
@@ -360,17 +387,36 @@ class ComfyUIEngine:
         for _ in range(1500):
             time.sleep(0.2)
             try:
-                with urllib.request.urlopen(
-                    f"{base_url}/history/{prompt_id}", timeout=10
-                ) as resp:
-                    history = json.loads(resp.read())
+                if comfyui_use_cloud:
+                    # Cloud: /api/history_v2/{id} 사용
+                    hist_req = urllib.request.Request(
+                        f"{base_url}/api/history_v2/{prompt_id}",
+                        headers=auth_hdr,
+                    )
+                    with urllib.request.urlopen(hist_req, timeout=10) as resp:
+                        history = json.loads(resp.read())
+                    # 응답 구조: {"prompt_id": ..., "status": "completed", "outputs": {...}}
+                    status = history.get("status", "")
+                    if status == "failed":
+                        raise RuntimeError(f"ComfyUI 클라우드 작업 실패: {history.get('error', '')}")
+                    if status != "completed":
+                        continue
+                    outputs = history.get("outputs", {})
+                else:
+                    hist_req = urllib.request.Request(
+                        f"{base_url}/history/{prompt_id}",
+                        headers=auth_hdr,
+                    )
+                    with urllib.request.urlopen(hist_req, timeout=10) as resp:
+                        history = json.loads(resp.read())
+                    if prompt_id not in history:
+                        continue
+                    outputs = history[prompt_id].get("outputs", {})
+            except RuntimeError:
+                raise
             except Exception:
                 continue
 
-            if prompt_id not in history:
-                continue
-
-            outputs = history[prompt_id].get("outputs", {})
             for node_out in outputs.values():
                 imgs = node_out.get("images", [])
                 if imgs:
@@ -387,10 +433,12 @@ class ComfyUIEngine:
             "subfolder": out_info.get("subfolder", ""),
             "type": out_info.get("type", "output"),
         })
+        view_req = urllib.request.Request(
+            f"{base_url}{api_prefix}/view?{params}",
+            headers=auth_hdr,
+        )
         try:
-            with urllib.request.urlopen(
-                f"{base_url}/view?{params}", timeout=30
-            ) as resp:
+            with urllib.request.urlopen(view_req, timeout=30) as resp:
                 result_bytes = resp.read()
         except Exception as e:
             raise RuntimeError(f"ComfyUI 결과 다운로드 실패: {e}")
@@ -561,6 +609,8 @@ class ProcessWorker(threading.Thread):
                         denoise             = s.get("denoise", 2),
                         exe_path            = s.get("ncnn_exe", ""),
                         model               = s.get("ncnn_model", ""),
+                        comfyui_use_cloud   = s.get("comfyui_use_cloud", False),
+                        comfyui_api_key     = s.get("comfyui_api_key", ""),
                         comfyui_host        = s.get("comfyui_host", "127.0.0.1"),
                         comfyui_port        = s.get("comfyui_port", 8188),
                         comfyui_model       = s.get("comfyui_model", "RealESRGAN_x4plus.pth"),
@@ -653,6 +703,8 @@ class App(tk.Tk):
         self.var_ch_g           = tk.BooleanVar(value=True)
         self.var_ch_b           = tk.BooleanVar(value=True)
         self.var_ch_a           = tk.BooleanVar(value=True)
+        self.var_comfyui_use_cloud   = tk.BooleanVar(value=False)
+        self.var_comfyui_api_key     = tk.StringVar(value="")
         self.var_comfyui_host        = tk.StringVar(value="127.0.0.1")
         self.var_comfyui_port        = tk.StringVar(value="8188")
         self.var_comfyui_model       = tk.StringVar(value=COMFYUI_UPSCALE_MODELS[0])
@@ -889,12 +941,36 @@ class App(tk.Tk):
 
         # ComfyUI 서버 설정
         self.f_comfyui = ttk.Frame(c, style="Card.TFrame")
-        r_host = self._row(self.f_comfyui, "서버 주소:", 12)
+
+        # 클라우드 / 로컬 토글
+        r_mode = self._row(self.f_comfyui, "서버 모드:", 12)
+        ttk.Radiobutton(r_mode, text="로컬  (http://host:port)",
+                        variable=self.var_comfyui_use_cloud, value=False,
+                        style="TRadiobutton",
+                        command=self._refresh_comfyui_mode_ui).pack(side="left", padx=(4, 12))
+        ttk.Radiobutton(r_mode, text="클라우드  (cloud.comfy.org)",
+                        variable=self.var_comfyui_use_cloud, value=True,
+                        style="TRadiobutton",
+                        command=self._refresh_comfyui_mode_ui).pack(side="left")
+
+        # 로컬 전용 행
+        self.f_comfyui_local = ttk.Frame(self.f_comfyui, style="Card.TFrame")
+        r_host = self._row(self.f_comfyui_local, "서버 주소:", 12)
         ttk.Entry(r_host, textvariable=self.var_comfyui_host,
                   width=20).pack(side="left", padx=4)
         ttk.Label(r_host, text="포트:", style="Card.TLabel").pack(side="left", padx=(8, 0))
         ttk.Entry(r_host, textvariable=self.var_comfyui_port,
                   width=7).pack(side="left", padx=4)
+        self.f_comfyui_local.pack(fill="x")
+
+        # 클라우드 전용 행
+        self.f_comfyui_cloud = ttk.Frame(self.f_comfyui, style="Card.TFrame")
+        r_key = self._row(self.f_comfyui_cloud, "API 키:", 12)
+        self.ent_api_key = ttk.Entry(r_key, textvariable=self.var_comfyui_api_key,
+                                     width=48, show="*")
+        self.ent_api_key.pack(side="left", padx=4)
+        ttk.Button(r_key, text="보기",
+                   command=self._toggle_api_key_visibility).pack(side="left")
         r_model = self._row(self.f_comfyui, "업스케일 모델:", 12)
         ttk.Combobox(r_model, textvariable=self.var_comfyui_model,
                      values=COMFYUI_UPSCALE_MODELS, width=36).pack(side="left", padx=4)
@@ -1185,7 +1261,20 @@ class App(tk.Tk):
         for cb in self.ch_checks:
             cb.configure(state="normal" if enabled else "disabled")
 
+    def _refresh_comfyui_mode_ui(self):
+        if self.var_comfyui_use_cloud.get():
+            self.f_comfyui_local.pack_forget()
+            self.f_comfyui_cloud.pack(fill="x")
+        else:
+            self.f_comfyui_cloud.pack_forget()
+            self.f_comfyui_local.pack(fill="x")
+
+    def _toggle_api_key_visibility(self):
+        current = self.ent_api_key.cget("show")
+        self.ent_api_key.configure(show="" if current == "*" else "*")
+
     def _refresh_comfyui_ui(self):
+        self._refresh_comfyui_mode_ui()
         if self.var_comfyui_workflow.get() == "controlnet_tile":
             self.f_comfyui_cn.pack(fill="x", pady=(6, 0))
         else:
@@ -1301,6 +1390,8 @@ class App(tk.Tk):
             "overwrite":      self.var_overwrite.get(),
             "split_channels": bool(channels),
             "channels":       channels,
+            "comfyui_use_cloud":   self.var_comfyui_use_cloud.get(),
+            "comfyui_api_key":     self.var_comfyui_api_key.get().strip(),
             "comfyui_host":        self.var_comfyui_host.get().strip(),
             "comfyui_port":        int(self.var_comfyui_port.get() or 8188),
             "comfyui_model":       self.var_comfyui_model.get(),
