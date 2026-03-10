@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install pyinstaller -q)",
+      "Bash(python -m PyInstaller --version)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\(''dds_tga_upscaler.py''\\).read\\(\\)\\); print\\(''문법 OK''\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\(''dds_tga_upscaler.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''문법 OK''\\)\")",
+      "Bash(python -m PyInstaller --onefile --windowed --name \"DDS_TGA_Upscaler\" --clean dds_tga_upscaler.py)"
+    ]
+  }
+}
